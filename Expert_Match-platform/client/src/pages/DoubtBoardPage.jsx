@@ -1,0 +1,303 @@
+import { useEffect, useState } from 'react';
+import { assignExpertToDoubt, createDoubt, fetchDoubtMatches, fetchDoubts, updateDoubt } from '../services/doubtApi.js';
+import { createSession } from '../services/sessionApi.js';
+
+const initialForm = {
+  requesterName: '',
+  title: '',
+  description: '',
+  category: 'Development'
+};
+
+function toLifecycleLabel(value) {
+  const key = String(value || '').trim().toLowerCase();
+  if (key === 'in_chat') return 'In Chat';
+  if (key === 'requested') return 'Requested';
+  if (key === 'assigned') return 'Assigned';
+  if (key === 'completed') return 'Completed';
+  if (key === 'declined') return 'Declined';
+  return 'Open';
+}
+
+function DoubtBoardPage({ onOpenSession, currentUser }) {
+  const [form, setForm] = useState(initialForm);
+  const [doubts, setDoubts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [matchState, setMatchState] = useState({ doubtId: null, loading: false, error: '', data: null });
+  const [suggestions, setSuggestions] = useState({ specialties: [] });
+  const [lastCreatedDoubtId, setLastCreatedDoubtId] = useState(null);
+  const [sessionStarting, setSessionStarting] = useState(null);
+
+  async function loadDoubts() {
+    try {
+      const data = await fetchDoubts();
+      setDoubts(data);
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadDoubts();
+  }, []);
+
+  useEffect(() => {
+    if (currentUser?.fullName) {
+      setForm((prev) => ({
+        ...prev,
+        requesterName: prev.requesterName || currentUser.fullName
+      }));
+    }
+  }, [currentUser]);
+
+  function onChange(event) {
+    const { name, value } = event.target;
+    setForm((prev) => ({ ...prev, [name]: value }));
+  }
+
+  async function onSubmit(event) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError('');
+    setSuccess('');
+
+    try {
+      const result = await createDoubt({
+        ...form,
+        requesterName: currentUser?.fullName || form.requesterName
+      });
+
+      // server returns { doubt, suggestions }
+      const created = result?.doubt || result;
+      setLastCreatedDoubtId(created?.id || null);
+      const sugg = result?.suggestions || { specialties: [] };
+
+      setSuccess('Doubt posted successfully.');
+      setForm((prev) => ({ ...initialForm, requesterName: prev.requesterName || currentUser?.fullName || '' }));
+      setSuggestions(sugg);
+      await loadDoubts();
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function applyCategorySuggestion(doubtId, suggestion) {
+    setError('');
+    try {
+      await updateDoubt(doubtId, { category: suggestion });
+      setSuccess(`Category updated to ${suggestion}`);
+      setSuggestions({ specialties: [] });
+      await loadDoubts();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  return (
+    <section className="page-card doubt-layout">
+      <div>
+        <p className="label">Create & Discuss</p>
+        <h1>Post a new doubt</h1>
+        <p className="subtitle">Post questions about any topic. Students and experts can help each other grow.</p>
+
+        <form className="profile-form" onSubmit={onSubmit}>
+          <p className="muted">Posting as: <strong>{currentUser?.fullName || form.requesterName || 'User'}</strong></p>
+          <label>
+            <span style={{ display: 'block', marginBottom: '0.25rem', fontWeight: 700 }}>📝 Doubt Title</span>
+            <input name="title" value={form.title} onChange={onChange} placeholder="What's your question?" required />
+          </label>
+          <label>
+            <span style={{ display: 'block', marginBottom: '0.25rem', fontWeight: 700 }}>🏷️ Category</span>
+            <select name="category" value={form.category} onChange={onChange}>
+              <option>Development</option>
+              <option>Data Science</option>
+              <option>Cloud</option>
+              <option>Business</option>
+            </select>
+          </label>
+          <label>
+            <span style={{ display: 'block', marginBottom: '0.25rem', fontWeight: 700 }}>✍️ Description</span>
+            <textarea name="description" value={form.description} onChange={onChange} rows="5" placeholder="Provide context and details..." required />
+          </label>
+          <button type="submit" className="primary-btn" disabled={submitting}>
+            {submitting ? 'Posting...' : '📤 Post Doubt'}
+          </button>
+        </form>
+
+        {suggestions?.specialties?.length ? (
+          <div style={{ marginTop: '1rem' }}>
+            <p className="label">Suggested specialties</p>
+            <div className="chips compact">
+              {suggestions.specialties.map((s) => (
+                <span key={s} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <span>{s}</span>
+                  <button
+                    type="button"
+                    className="small-btn"
+                    onClick={() => applyCategorySuggestion(lastCreatedDoubtId, s)}
+                  >
+                    Use as Category
+                  </button>
+                </span>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {error ? <p className="error-box">{error}</p> : null}
+        {success ? <p className="success-box">{success}</p> : null}
+      </div>
+
+      <div>
+        <p className="label">Activity Feed</p>
+        <h2>Recent doubts</h2>
+        {loading ? <p className="muted">Loading doubts...</p> : null}
+        <div className="doubt-list">
+          {doubts.map((doubt) => (
+            <article key={doubt.id} className="doubt-card">
+              <div className="directory-topline">
+                <span className={`status-badge lifecycle-${String(doubt.lifecycleTag || 'open').toLowerCase()}`}>
+                  {toLifecycleLabel(doubt.lifecycleTag || doubt.status)}
+                </span>
+                <span className="mini-id">{doubt.category}</span>
+              </div>
+              <h3>{doubt.title}</h3>
+              <p className="muted">{doubt.description}</p>
+              <div className="meta-row">
+                <strong>{doubt.requesterName}</strong>
+                <span>{doubt.createdAtLabel}</span>
+              </div>
+
+              {String(doubt.lifecycleTag || '').toLowerCase() === 'completed' && doubt.assignedExpert ? (
+                <p className="muted">Resolved with {doubt.assignedExpert.fullName}</p>
+              ) : null}
+
+              <button
+                type="button"
+                className="secondary-btn stretch-btn"
+                onClick={async () => {
+                  setMatchState({ doubtId: doubt.id, loading: true, error: '', data: null });
+                  try {
+                    const data = await fetchDoubtMatches(doubt.id);
+                    setMatchState({ doubtId: doubt.id, loading: false, error: '', data });
+                  } catch (matchError) {
+                    setMatchState({ doubtId: doubt.id, loading: false, error: matchError.message, data: null });
+                  }
+                }}
+              >
+                Match Experts
+              </button>
+
+              {matchState.doubtId === doubt.id && matchState.loading ? (
+                <p className="muted">Finding best experts...</p>
+              ) : null}
+
+              {matchState.doubtId === doubt.id && matchState.error ? (
+                <p className="error-box">{matchState.error}</p>
+              ) : null}
+
+              {matchState.doubtId === doubt.id && matchState.data ? (
+                <div className="match-box">
+                  <p className="label">Matched Keywords</p>
+                  <div className="chips compact">
+                    {matchState.data.keywords.map((keyword) => (
+                      <span key={keyword}>{keyword}</span>
+                    ))}
+                  </div>
+
+                  <div className="match-list">
+                    {matchState.data.matches.length ? (
+                      matchState.data.matches.map((expert) => (
+                        <div key={expert.id} className="match-item">
+                          <div>
+                            <strong>{expert.fullName}</strong>
+                            <p className="muted">{expert.specialties.slice(0, 3).join(', ') || 'No skills listed'}</p>
+                            <p className="muted">Status: {expert.availabilityStatus || 'offline'}</p>
+                            <p className="muted">
+                              ★ {Number(expert.rating || 0).toFixed(1)} ({expert.reviewCount || 0} reviews)
+                            </p>
+                          </div>
+                          <div className="match-actions">
+                            {currentUser?.role === 'student' ? (
+                              <button
+                                type="button"
+                                className="secondary-btn"
+                                disabled={String(expert.availabilityStatus || '').toLowerCase() !== 'available'}
+                                onClick={async () => {
+                                  try {
+                                    setError('');
+                                    const result = await assignExpertToDoubt(doubt.id, expert.id);
+                                    const requestSent = Boolean(result?.requestCreated) || String(result?.session?.status || '').toLowerCase() === 'requested';
+                                    setSuccess(
+                                      requestSent
+                                        ? `Assigned ${expert.fullName} and sent chat request. Expert can accept or decline in Sessions.`
+                                        : `Assigned ${expert.fullName} to doubt #${doubt.id}.`
+                                    );
+                                    await loadDoubts();
+                                  } catch (assignError) {
+                                    setError(assignError.message);
+                                  }
+                                }}
+                              >
+                                {String(expert.availabilityStatus || '').toLowerCase() === 'available'
+                                  ? 'Assign Expert'
+                                  : 'Unavailable'}
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <p className="muted">No matching experts found for this doubt.</p>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+
+              {doubt.assignedExpert && currentUser?.role === 'student' ? (
+                <div className="assigned-strip">
+                  <p className="success-box">
+                    Assigned to {doubt.assignedExpert.fullName} ({doubt.assignedExpert.title || 'Expert'})
+                  </p>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    disabled={sessionStarting === doubt.id}
+                    onClick={async () => {
+                      setSessionStarting(doubt.id);
+                      setError('');
+                      setSuccess('');
+                      try {
+                        const session = await createSession({ doubtId: doubt.id, expertId: doubt.assignedExpert.id });
+                        if (String(session?.status || '').toLowerCase() === 'requested') {
+                          setSuccess(`Request pending with ${doubt.assignedExpert.fullName}. Waiting for expert confirmation.`);
+                        } else {
+                          setSuccess(`Opened existing session #${session.id} for doubt #${doubt.id}.`);
+                        }
+                        if (onOpenSession) onOpenSession(session);
+                      } catch (sessionError) {
+                        setError(`Failed to start chat: ${sessionError.message}`);
+                      } finally {
+                        setSessionStarting(null);
+                      }
+                    }}
+                  >
+                    {sessionStarting === doubt.id ? 'Opening...' : 'Open Session'}
+                  </button>
+                </div>
+              ) : null}
+            </article>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default DoubtBoardPage;

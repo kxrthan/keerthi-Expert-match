@@ -1,0 +1,975 @@
+import { useEffect, useMemo, useState } from 'react';
+import {
+  fetchSessionRating,
+  fetchSessionBilling,
+  fetchUnreadCounts,
+  fetchSessionMessages,
+  fetchSessions,
+  markSessionRead,
+  respondToSessionRequest,
+  submitSessionRating,
+  updateSessionStatus
+} from '../services/sessionApi.js';
+import { submitReport } from '../services/reportApi.js';
+import { getChatSocket } from '../services/chatSocket.js';
+import { fetchMyWallet } from '../services/walletApi.js';
+
+const initialDraft = {
+  senderRole: 'student',
+  senderName: 'Student',
+  message: ''
+};
+
+function toSessionId(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function toTimeMs(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    const dateMs = value.getTime();
+    return Number.isFinite(dateMs) ? dateMs : null;
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && String(value).trim() === String(numeric)) {
+    return numeric;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function SessionChatPage({ initialSessionId, currentUser, onSelectSession }) {
+  const [sessions, setSessions] = useState([]);
+  const [selectedSessionId, setSelectedSessionId] = useState(initialSessionId || null);
+  const [messages, setMessages] = useState([]);
+  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [error, setError] = useState('');
+  const [draft, setDraft] = useState({
+    ...initialDraft,
+    senderRole: currentUser?.role || initialDraft.senderRole,
+    senderName: currentUser?.fullName || initialDraft.senderName
+  });
+  const [typingBySession, setTypingBySession] = useState({});
+  const [presenceBySession, setPresenceBySession] = useState({});
+  const [unreadBySession, setUnreadBySession] = useState({});
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [ratingLoading, setRatingLoading] = useState(false);
+  const [ratingSubmitting, setRatingSubmitting] = useState(false);
+  const [sessionRating, setSessionRating] = useState(null);
+  const [ratingForm, setRatingForm] = useState({ rating: 0, reviewText: '' });
+  const [successMessage, setSuccessMessage] = useState('');
+  const [sessionBilling, setSessionBilling] = useState(null);
+  const [walletBalance, setWalletBalance] = useState(null);
+
+  function buildBillingConfirmation(billing, role) {
+    if (!billing) return '';
+
+    const amount = Number(billing.amountCharged || billing.amountDue || 0).toFixed(2);
+    const duration = Number(billing.durationSeconds || 0);
+    const minutes = Number(billing.billableMinutes || 0);
+
+    if (String(billing.status || '').toLowerCase() === 'paid') {
+      if (String(role || '').toLowerCase() === 'expert') {
+        return `Payment received: Rs ${amount} credited to your wallet for ${duration}s (${minutes} min billable).`;
+      }
+      return `Payment successful: Rs ${amount} deducted from your wallet and paid to the expert for ${duration}s (${minutes} min billable).`;
+    }
+
+    if (String(billing.status || '').toLowerCase() === 'insufficient_balance') {
+      return billing.notes || 'Payment failed: insufficient wallet balance.';
+    }
+
+    return billing.notes || 'Billing could not be completed for this session.';
+  }
+
+  const selectedSession = useMemo(
+    () => sessions.find((session) => toSessionId(session.id) === toSessionId(selectedSessionId)) || null,
+    [sessions, selectedSessionId]
+  );
+  const chatIsActive = useMemo(() => {
+    const status = String(selectedSession?.status || '').toLowerCase();
+    if (status !== 'active') return false;
+    if (!selectedSession?.startedAt) return false;
+    const startAtMs = new Date(selectedSession.startedAt).getTime();
+    if (!Number.isFinite(startAtMs)) return false;
+    return Date.now() >= startAtMs;
+  }, [selectedSession?.status, selectedSession?.startedAt]);
+
+  const minimumWalletBalance = 100;
+  const estimatedBillableMinutes = useMemo(() => {
+    if (!chatIsActive || !selectedSession?.startedAt) return 0;
+    return elapsedSeconds > 0 ? Math.max(1, Math.ceil(elapsedSeconds / 60)) : 0;
+  }, [chatIsActive, elapsedSeconds, selectedSession?.startedAt]);
+  const estimatedCharge = useMemo(() => {
+    const rate = Number(selectedSession?.expert?.pricePerMinute || 0);
+    return Number((estimatedBillableMinutes * rate).toFixed(2));
+  }, [estimatedBillableMinutes, selectedSession?.expert?.pricePerMinute]);
+  const studentWalletBalance = Number(walletBalance ?? 0);
+  const walletAllowsChat = currentUser?.role !== 'student'
+    ? true
+    : walletBalance !== null
+      && studentWalletBalance >= minimumWalletBalance
+      && studentWalletBalance >= estimatedCharge;
+
+  const canComposeMessage = useMemo(() => {
+    return chatIsActive && walletAllowsChat;
+  }, [chatIsActive, walletAllowsChat]);
+
+  const timerStartAt = useMemo(() => {
+    if (!selectedSession) return null;
+
+    const status = String(selectedSession.status || '').toLowerCase();
+    if (status !== 'active' && status !== 'completed') return null;
+    return toTimeMs(selectedSession.startedAt);
+  }, [selectedSession]);
+
+  function isCurrentParticipant(senderRole, senderName) {
+    return (
+      String(senderRole || '').trim().toLowerCase() === String(draft.senderRole || '').trim().toLowerCase() &&
+      String(senderName || '').trim() === String(draft.senderName || '').trim()
+    );
+  }
+
+  function formatSeconds(totalSeconds) {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function getRatingLabel(value) {
+    const labels = ['Select a rating', 'Poor', 'Needs Improvement', 'Good', 'Very Good', 'Excellent'];
+    const normalized = Math.max(0, Math.min(5, Number(value) || 0));
+    return labels[normalized] || labels[0];
+  }
+
+  function renderRatingStars(value, readOnly = false) {
+    const normalized = Math.max(0, Math.min(5, Number(value) || 0));
+
+    return [1, 2, 3, 4, 5].map((star) => (
+      <button
+        key={star}
+        type="button"
+        className={`star ${star <= normalized ? 'filled' : ''} ${readOnly ? 'readonly' : ''}`}
+        onClick={readOnly ? undefined : () => setRatingForm((prev) => ({ ...prev, rating: star }))}
+        disabled={readOnly || ratingSubmitting || Boolean(sessionRating?.id)}
+        title={`${star} star${star !== 1 ? 's' : ''}`}
+      >
+        ★
+      </button>
+    ));
+  }
+
+  async function loadUnreadCounts() {
+    try {
+      const data = await fetchUnreadCounts();
+      setUnreadBySession(data);
+    } catch (loadError) {
+      setError(loadError.message);
+    }
+  }
+
+  useEffect(() => {
+    const socket = getChatSocket();
+
+    function onNewMessage(message) {
+      if (Number(message.sessionId) === Number(selectedSessionId)) {
+        setMessages((prev) => {
+          if (prev.some((item) => item.id === message.id)) {
+            return prev;
+          }
+          return [...prev, message];
+        });
+
+        if (!isCurrentParticipant(message.senderRole, message.senderName)) {
+          socket.emit('mark_read', {
+            sessionId: selectedSessionId,
+            senderRole: draft.senderRole,
+            senderName: draft.senderName
+          });
+        }
+      } else {
+        if (isCurrentParticipant(message.senderRole, message.senderName)) {
+          return;
+        }
+
+        setUnreadBySession((prev) => ({
+          ...prev,
+          [message.sessionId]: (prev[message.sessionId] || 0) + 1
+        }));
+      }
+    }
+
+    function onTyping(payload) {
+      const sessionId = Number(payload?.sessionId);
+      if (!sessionId) return;
+
+      setTypingBySession((prev) => {
+        if (!payload.isTyping) {
+          const clone = { ...prev };
+          delete clone[sessionId];
+          return clone;
+        }
+
+        return {
+          ...prev,
+          [sessionId]: payload.senderName || 'Someone'
+        };
+      });
+    }
+
+    function onRoomPresence(payload) {
+      const sessionId = Number(payload?.sessionId);
+      if (!sessionId) return;
+
+      setPresenceBySession((prev) => ({
+        ...prev,
+        [sessionId]: Number(payload.onlineCount) || 0
+      }));
+    }
+
+    function onMessageStatusUpdated(payload) {
+      const sessionId = Number(payload?.sessionId);
+      if (!sessionId || sessionId !== Number(selectedSessionId)) return;
+
+      const messageIds = Array.isArray(payload?.messageIds) ? payload.messageIds.map(Number) : [];
+      if (!messageIds.length) return;
+
+      setMessages((prev) =>
+        prev.map((item) => {
+          if (!messageIds.includes(Number(item.id))) return item;
+
+          return {
+            ...item,
+            messageStatus: payload.status || item.messageStatus
+          };
+        })
+      );
+    }
+
+    function onConnectError(connectionError) {
+      setError(connectionError.message || 'Realtime connection failed');
+    }
+
+    function onSessionLifecycle(payload) {
+      const incoming = payload?.session;
+      if (!incoming?.id) return;
+      
+      // Immediately update local state with new session data
+      setSessions((prev) => {
+        const index = prev.findIndex((item) => Number(item.id) === Number(incoming.id));
+        if (index === -1) {
+          return [incoming, ...prev];
+        }
+        const clone = [...prev];
+        clone[index] = incoming;
+        return clone;
+      });
+      
+      // If this is the selected session and status changed to active, ensure it's in view
+      if (Number(incoming.id) === Number(selectedSessionId)) {
+        // Force a visual update by triggering message load
+        if (String(incoming.status).toLowerCase() === 'active') {
+          fetchSessionMessages(selectedSessionId)
+            .then((messages) => {
+              setMessages(messages);
+            })
+            .catch(() => {});
+        }
+      }
+      
+      // Refresh from server to ensure we have latest data
+      loadSessions(false);
+    }
+
+    socket.on('new_message', onNewMessage);
+    socket.on('typing', onTyping);
+    socket.on('room_presence', onRoomPresence);
+    socket.on('message_status_updated', onMessageStatusUpdated);
+    socket.on('session_request_created', onSessionLifecycle);
+    socket.on('session_request_responded', onSessionLifecycle);
+    socket.on('session_status_updated', onSessionLifecycle);
+    socket.on('connect_error', onConnectError);
+
+    return () => {
+      socket.off('new_message', onNewMessage);
+      socket.off('typing', onTyping);
+      socket.off('room_presence', onRoomPresence);
+      socket.off('message_status_updated', onMessageStatusUpdated);
+      socket.off('session_request_created', onSessionLifecycle);
+      socket.off('session_request_responded', onSessionLifecycle);
+      socket.off('session_status_updated', onSessionLifecycle);
+      socket.off('connect_error', onConnectError);
+    };
+  }, [selectedSessionId, draft.senderName, draft.senderRole]);
+
+  async function loadSessions(showLoading = true) {
+    if (showLoading) setLoadingSessions(true);
+    try {
+      const data = await fetchSessions();
+      setSessions(data);
+
+      if (selectedSessionId && !data.some((item) => Number(item.id) === Number(selectedSessionId))) {
+        setSelectedSessionId(null);
+      }
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      if (showLoading) setLoadingSessions(false);
+    }
+  }
+
+  useEffect(() => {
+    loadSessions();
+    loadUnreadCounts();
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadSessions(false);
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    loadUnreadCounts();
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (currentUser?.role !== 'student') {
+      setWalletBalance(null);
+      return;
+    }
+
+    let active = true;
+
+    async function loadWallet() {
+      try {
+        const data = await fetchMyWallet();
+        if (!active) return;
+        setWalletBalance(Number(data?.wallet?.balance || 0));
+      } catch (loadError) {
+        if (!active) return;
+        setError(loadError.message);
+      }
+    }
+
+    loadWallet();
+
+    const interval = setInterval(loadWallet, 5000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [currentUser?.id, currentUser?.role, selectedSessionId]);
+
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    const socket = getChatSocket();
+    socket.emit('register_user', {
+      userId: currentUser.id,
+      fullName: currentUser.fullName,
+      role: currentUser.role
+    });
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      loadSessions(false);
+      loadUnreadCounts();
+    }, 3000);
+
+    function onFocus() {
+      loadSessions(false);
+      loadUnreadCounts();
+    }
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    setDraft((prev) => ({
+      ...prev,
+      senderRole: currentUser?.role || prev.senderRole,
+      senderName: currentUser?.fullName || prev.senderName
+    }));
+  }, [currentUser]);
+
+  useEffect(() => {
+    setSelectedSessionId(toSessionId(initialSessionId));
+  }, [initialSessionId]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      return;
+    }
+
+    let active = true;
+    setLoadingMessages(true);
+
+    fetchSessionMessages(selectedSessionId)
+      .then((data) => {
+        if (active) {
+          setMessages(data);
+          markSessionRead(selectedSessionId)
+            .then(() => {
+              setUnreadBySession((prev) => ({ ...prev, [selectedSessionId]: 0 }));
+            })
+            .catch(() => {});
+        }
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoadingMessages(false);
+      });
+
+    const aggressiveInterval = setInterval(async () => {
+      if (!active || !selectedSessionId) return;
+      loadSessions(false);
+    }, 500);
+
+    return () => {
+      active = false;
+      clearInterval(aggressiveInterval);
+    };
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      return;
+    }
+
+    const socket = getChatSocket();
+    
+    socket.emit('join_session', {
+      sessionId: selectedSessionId,
+      senderName: draft.senderName,
+      senderRole: draft.senderRole
+    }, (ack) => {
+      // Server confirmed join succeeded - immediately refresh sessions
+      setTimeout(() => {
+        loadSessions(false);
+      }, 100);
+    });
+    
+    // Also immediately refresh after a very short delay to catch status changes
+    const refreshTimer = setTimeout(() => {
+      loadSessions(false);
+    }, 300);
+    
+    setUnreadBySession((prev) => ({ ...prev, [selectedSessionId]: 0 }));
+
+    return () => {
+      clearTimeout(refreshTimer);
+      socket.emit('leave_session', { sessionId: selectedSessionId });
+    };
+  }, [selectedSessionId, draft.senderName, draft.senderRole]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setSessionRating(null);
+      return;
+    }
+
+    if (String(selectedSession?.status || '').toLowerCase() !== 'completed') {
+      setSessionRating(null);
+      return;
+    }
+
+    let active = true;
+    setRatingLoading(true);
+
+    fetchSessionRating(selectedSessionId)
+      .then((data) => {
+        if (!active) return;
+        setSessionRating(data);
+        if (data?.rating) {
+          setRatingForm({
+            rating: Number(data.rating),
+            reviewText: data.reviewText || ''
+          });
+        } else {
+          setRatingForm({ rating: 0, reviewText: '' });
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setSessionRating(null);
+      })
+      .finally(() => {
+        if (active) setRatingLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedSessionId, selectedSession?.status, currentUser?.role]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setSessionBilling(null);
+      return;
+    }
+
+    if (String(selectedSession?.status || '').toLowerCase() !== 'completed') {
+      setSessionBilling(null);
+      return;
+    }
+
+    let active = true;
+    fetchSessionBilling(selectedSessionId)
+      .then((data) => {
+        if (!active) return;
+        setSessionBilling(data || null);
+      })
+      .catch(() => {
+        if (!active) return;
+        setSessionBilling(null);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedSessionId, selectedSession?.status]);
+
+  useEffect(() => {
+    if (!timerStartAt) {
+      setElapsedSeconds(0);
+      return;
+    }
+
+    const tick = () => {
+      const startTime = Number(timerStartAt);
+      const endTime = selectedSession.endedAt ? new Date(selectedSession.endedAt).getTime() : Date.now();
+      const elapsed = Math.floor((endTime - startTime) / 1000);
+      setElapsedSeconds(elapsed < 0 ? 0 : elapsed);
+    };
+
+    tick();
+    const interval = setInterval(tick, 1000);
+
+    return () => clearInterval(interval);
+  }, [timerStartAt, selectedSession?.endedAt, selectedSession?.id]);
+
+  async function onSend(event) {
+    event.preventDefault();
+    if (!selectedSessionId) return;
+    if (!chatIsActive) return;
+
+    try {
+      const socket = getChatSocket();
+
+      await new Promise((resolve, reject) => {
+        socket.emit(
+          'send_message',
+          {
+            sessionId: selectedSessionId,
+            senderRole: draft.senderRole,
+            senderName: draft.senderName,
+            message: draft.message
+          },
+          (response) => {
+            if (response?.ok) {
+              resolve(response.data);
+            } else {
+              reject(new Error(response?.message || 'Failed to send message'));
+            }
+          }
+        );
+      });
+
+      setDraft((prev) => ({ ...prev, message: '' }));
+      socket.emit('typing', {
+        sessionId: selectedSessionId,
+        isTyping: false,
+        senderName: draft.senderName
+      });
+      setError('');
+    } catch (sendError) {
+      setError(sendError.message || 'Failed to send message');
+    }
+  }
+
+  async function onRespondToRequest(decision) {
+    if (!selectedSessionId) return;
+
+    try {
+      const updated = await respondToSessionRequest(selectedSessionId, decision);
+      setSessions((prev) => prev.map((session) => (session.id === updated.id ? updated : session)));
+
+      loadSessions(false);
+      setError('');
+    } catch (respondError) {
+      setError(respondError.message);
+    }
+  }
+
+  async function onStatusChange(status) {
+    if (!selectedSessionId) return;
+
+    try {
+      const updated = await updateSessionStatus(selectedSessionId, status);
+      setSessions((prev) => prev.map((session) => (session.id === updated.id ? updated : session)));
+
+      if (String(status || '').toLowerCase() === 'completed') {
+        const billing = updated?.billing || null;
+        if (billing) {
+          setSessionBilling(billing);
+          const confirmation = buildBillingConfirmation(billing, currentUser?.role);
+          if (confirmation) {
+            setSuccessMessage(confirmation);
+            setTimeout(() => setSuccessMessage(''), 6000);
+          }
+        }
+      }
+
+      setError('');
+    } catch (statusError) {
+      setError(statusError.message);
+    }
+  }
+
+  async function onSubmitRating(event) {
+    event.preventDefault();
+    if (!selectedSessionId) return;
+
+    try {
+      setRatingSubmitting(true);
+      setError('');
+      setSuccessMessage('');
+      const saved = await submitSessionRating(selectedSessionId, {
+        rating: Number(ratingForm.rating),
+        reviewText: ratingForm.reviewText
+      });
+      setSessionRating(saved);
+      
+      // Show success message
+      setSuccessMessage('✓ Rating submitted successfully!');
+      setTimeout(() => setSuccessMessage(''), 3000);
+      
+      // Notify expert to refresh their profile
+      const socket = getChatSocket();
+      socket.emit('expert_rating_update', {
+        expertId: selectedSession?.expert?.id,
+        sessionId: selectedSessionId
+      });
+      
+      // Refresh expert list to update ratings across app
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('expertRatingUpdated', {
+          detail: { expertId: selectedSession?.expert?.id }
+        }));
+      }, 500);
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setRatingSubmitting(false);
+    }
+  }
+
+  async function onReportParticipant() {
+    if (!selectedSession) return;
+
+    const reason = window.prompt('Describe the bad behavior (minimum 10 characters):', '');
+    if (reason === null) return;
+
+    try {
+      setError('');
+      setSuccessMessage('');
+
+      const payload = {
+        sessionId: selectedSession.id,
+        category: 'Unprofessional Behavior',
+        reason: String(reason || '').trim()
+      };
+
+      if (String(currentUser?.role || '').toLowerCase() === 'student') {
+        payload.reportedExpertId = selectedSession?.expert?.id;
+      } else {
+        payload.reportedUserId = selectedSession?.doubt?.requesterUserId;
+      }
+
+      await submitReport(payload);
+      setSuccessMessage('Report submitted. Admin will review and take action if needed.');
+      setTimeout(() => setSuccessMessage(''), 4000);
+    } catch (reportError) {
+      setError(reportError.message || 'Failed to submit report');
+    }
+  }
+
+  return (
+    <section className="page-card session-layout">
+      <div>
+        <p className="label">🗂️ Sessions</p>
+        <h2>Active consultations</h2>
+        {loadingSessions ? <p className="muted">Loading sessions...</p> : null}
+        <div className="session-list">
+          {sessions.map((session) => (
+            <button
+              key={session.id}
+              type="button"
+              className={`session-item ${toSessionId(selectedSessionId) === toSessionId(session.id) ? 'active' : ''}`}
+              onClick={() => {
+                setSelectedSessionId(toSessionId(session.id));
+                if (typeof onSelectSession === 'function') {
+                  onSelectSession(session.id);
+                }
+              }}
+            >
+              <strong>
+                #{session.id} {session.doubt.title}
+                {unreadBySession[session.id] ? (
+                  <span className="unread-pill">{unreadBySession[session.id]}</span>
+                ) : null}
+              </strong>
+              <span className="muted">{session.expert.fullName}</span>
+              <div className="session-meta-line">
+                <span className="mini-id">{session.status}</span>
+                <span className="mini-id">{presenceBySession[session.id] || 0} online</span>
+              </div>
+              {currentUser?.role === 'expert' && session.status === 'requested' ? (
+                <p className="typing-line">New chat request awaiting your response</p>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="label">💬 Session Chat</p>
+        {!selectedSession ? (
+          <p className="muted">Select a session from the left to start chatting.</p>
+        ) : (
+          <>
+            <div className="session-headline">
+              <div>
+                <h2>{selectedSession.doubt.title}</h2>
+                <p className="muted">with <strong>{selectedSession.expert.fullName}</strong></p>
+                <p className="muted">Status: <strong>{String(selectedSession.status || '').toUpperCase()}</strong></p>
+                {selectedSession.status === 'requested' && currentUser?.role === 'expert' ? (
+                  <p className="muted">The student requested a chat. Please review and respond.</p>
+                ) : null}
+                {selectedSession.status === 'accepted_pending' ? (
+                  <p className="muted">Request accepted. Chat will start when both student and expert are online.</p>
+                ) : null}
+                {selectedSession.status === 'declined' ? (
+                  <p className="error-box session-inline-note">
+                    {selectedSession.declineReason || 'This session request was declined because the expert is currently unavailable.'}
+                  </p>
+                ) : null}
+                {currentUser?.role === 'student' && chatIsActive ? (
+                  <p className={walletAllowsChat ? 'muted' : 'error-box session-inline-note'}>
+                    Wallet balance: Rs {studentWalletBalance.toFixed(2)}. Minimum Rs {minimumWalletBalance} is required to chat.
+                    {walletAllowsChat
+                      ? ` Estimated chat charge so far: Rs ${estimatedCharge.toFixed(2)}.`
+                      : ' Top up your wallet to continue. The session will stop when the available balance is exhausted.'}
+                  </p>
+                ) : null}
+                <p className="timer-display">⏱️ Elapsed: {formatSeconds(elapsedSeconds)}</p>
+                {sessionBilling ? (
+                  <div className="billing-box">
+                    <p className="muted">Billing Summary</p>
+                    <p className="muted">
+                      {sessionBilling.billableMinutes} min x Rs {Number(sessionBilling.ratePerMinute || 0).toFixed(2)}
+                      {' = '}Rs {Number(sessionBilling.amountDue || 0).toFixed(2)}
+                    </p>
+                    <p className="mini-id">{sessionBilling.status}</p>
+                    <p className="muted">Charged: Rs {Number(sessionBilling.amountCharged || 0).toFixed(2)}</p>
+                    {sessionBilling.notes ? <p className="muted">{sessionBilling.notes}</p> : null}
+                  </div>
+                ) : null}
+                <p className="typing-line">
+                  {typingBySession[selectedSession.id]
+                    ? `${typingBySession[selectedSession.id]} is typing...`
+                    : `${presenceBySession[selectedSession.id] || 0} participants online`}
+                </p>
+              </div>
+              <div className="session-actions">
+                {currentUser?.role === 'expert' && selectedSession.status === 'requested' ? (
+                  <>
+                    <button type="button" className="secondary-btn" onClick={() => onRespondToRequest('accept')}>
+                      Accept Request
+                    </button>
+                    <button type="button" className="secondary-btn" onClick={() => onRespondToRequest('decline')}>
+                      Decline Request
+                    </button>
+                  </>
+                ) : null}
+                <button type="button" className="secondary-btn" onClick={onReportParticipant}>
+                  Report Bad Behavior
+                </button>
+                {selectedSession.status === 'active' ? (
+                  <button type="button" className="secondary-btn" onClick={() => onStatusChange('completed')}>
+                    End Chat
+                  </button>
+                ) : (
+                  <span className="muted">
+                    {selectedSession.status === 'requested'
+                      ? 'Waiting for expert decision to start chat.'
+                      : selectedSession.status === 'accepted_pending'
+                        ? 'Expert accepted. Waiting for both participants to be online.'
+                        : 'This chat is closed.'}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {loadingMessages ? <p className="muted">Loading messages...</p> : null}
+            <div className="chat-box">
+              {messages.length === 0 ? (
+                <p className="muted" style={{ textAlign: 'center', marginTop: 'var(--space-4)' }}>
+                  No messages yet. Start the conversation!
+                </p>
+              ) : null}
+              {messages.map((msg) => {
+                const isOwnMessage = isCurrentParticipant(msg.senderRole, msg.senderName);
+                const status = String(msg.messageStatus || 'sent').toLowerCase();
+                const isSeen = status === 'seen' || status === 'read';
+                const isSent = status === 'sent';
+
+                return (
+                  <div
+                    key={msg.id}
+                    className={`chat-bubble ${msg.senderRole} ${isOwnMessage ? 'own' : 'other'}`}
+                  >
+                    <div className="msg-content">
+                      {isOwnMessage ? null : <strong className="sender-name">{msg.senderName}</strong>}
+                      <p className="msg-text">{msg.message}</p>
+                    </div>
+                    <div className="msg-footer">
+                      <span className="msg-time">{msg.createdAtLabel}</span>
+                      {isOwnMessage ? (
+                        <span className={`msg-ticks ${isSeen ? 'seen' : isSent ? 'sent' : 'sending'}`}>
+                          {isSeen ? '✓✓' : isSent ? '✓' : '⏱'}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <form onSubmit={onSend} className="chat-form">
+              <p className="muted">You are sending as: {draft.senderName} ({draft.senderRole})</p>
+              <textarea
+                rows="3"
+                value={draft.message}
+                disabled={!canComposeMessage}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setDraft((prev) => ({ ...prev, message: value }));
+
+                  if (!selectedSessionId) return;
+
+                  const socket = getChatSocket();
+                  socket.emit('typing', {
+                    sessionId: selectedSessionId,
+                    isTyping: value.trim().length > 0,
+                    senderName: draft.senderName
+                  });
+                }}
+                placeholder={canComposeMessage
+                  ? 'Type your message'
+                  : currentUser?.role === 'student' && walletBalance !== null && studentWalletBalance < minimumWalletBalance
+                    ? 'Top up your wallet to Rs 100 to continue chatting'
+                    : 'Chat starts only when both student and expert are online in this session'}
+                required
+              />
+              <button type="submit" className="primary-btn" disabled={!canComposeMessage}>Send Message</button>
+            </form>
+
+            {String(selectedSession.status || '').toLowerCase() === 'completed' ? (
+              <div className="feedback-section">
+                {sessionRating?.id ? (
+                  <div className="feedback-card">
+                    <p className="label">Student Feedback</p>
+                    <h3>{currentUser?.role === 'expert' ? 'What the student said' : 'Your submitted feedback'}</h3>
+                    <div className="feedback-stars-row" aria-label={`Rating ${sessionRating.rating} out of 5`}>
+                      <div className="rating-stars">{renderRatingStars(sessionRating.rating, true)}</div>
+                      <span className="rating-count">{getRatingLabel(sessionRating.rating)}</span>
+                    </div>
+                    <p className="feedback-copy">
+                      {sessionRating.reviewText || 'No written feedback was provided.'}
+                    </p>
+                    <p className="muted feedback-meta-line">
+                      Submitted on {new Date(sessionRating.createdAt).toLocaleString('en-IN', {
+                        dateStyle: 'medium',
+                        timeStyle: 'short'
+                      })}
+                    </p>
+                  </div>
+                ) : null}
+
+                {currentUser?.role === 'student' && !sessionRating?.id ? (
+                  <form onSubmit={onSubmitRating} className="rating-card">
+                    <p className="label">Session Feedback</p>
+                    <h3>Rate your expert</h3>
+                    <p className="muted">Your rating helps improve expert quality for future students.</p>
+                    {ratingLoading ? <p className="muted">Loading your rating...</p> : null}
+
+                    <div className="rating-label">Rating</div>
+                    <div className="star-rating">
+                      {renderRatingStars(ratingForm.rating)}
+                    </div>
+                    <div className="rating-text">{getRatingLabel(ratingForm.rating)}</div>
+
+                    <label>
+                      Review (optional)
+                      <textarea
+                        rows="3"
+                        maxLength={500}
+                        value={ratingForm.reviewText}
+                        onChange={(event) => setRatingForm((prev) => ({ ...prev, reviewText: event.target.value }))}
+                        disabled={ratingSubmitting || Boolean(sessionRating?.id)}
+                        placeholder="Share your experience in a few words"
+                      />
+                    </label>
+
+                    {successMessage ? <p className="success-box">{successMessage}</p> : null}
+
+                    <button
+                      type="submit"
+                      className="secondary-btn"
+                      disabled={ratingSubmitting || Boolean(sessionRating?.id) || ratingForm.rating < 1}
+                    >
+                      {ratingSubmitting ? 'Saving rating...' : sessionRating?.id ? '✓ Rating Submitted' : 'Submit Rating'}
+                    </button>
+                  </form>
+                ) : null}
+
+                {!sessionRating?.id && currentUser?.role === 'expert' ? (
+                  <div className="feedback-card feedback-empty">
+                    <p className="label">Student Feedback</p>
+                    <h3>No feedback yet</h3>
+                    <p className="muted">Once the student submits a rating and review, it will appear here and in your notifications.</p>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </>
+        )}
+
+        {successMessage ? <p className="success-box">{successMessage}</p> : null}
+        {error ? <p className="error-box">{error}</p> : null}
+      </div>
+    </section>
+  );
+}
+
+export default SessionChatPage;
